@@ -1,6 +1,7 @@
 [package]
 authors = ["Nick Fitzgerald <fitzgen@gmail.com>"]
 categories = ["memory-management", "rust-patterns"]
+description = "A garbage collection library with zero `unsafe` code and zero dependencies."
 documentation = "https://docs.rs/safe-gc"
 edition = "2021"
 license = "MIT OR Apache-2.0"
