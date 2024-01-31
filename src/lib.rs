@@ -555,7 +555,7 @@ impl Collector {
 /// objects within a `Heap`: references may form arbitrary cycles and there is
 /// no imposed ownership hierarchy.
 ///
-/// ## Allocating Objects
+/// # Allocating Objects
 ///
 /// You can allocate objects with the [`Heap::alloc`] method.
 ///
@@ -613,7 +613,7 @@ impl Collector {
 /// heap[goomba].cat_tree = Some(tree.into());
 /// ```
 ///
-/// ## Accessing Allocating Objects
+/// # Accessing Allocating Objects
 ///
 /// Rather than dereferencing pointers to allocated GC objects directly, you
 /// must use one of two types ([`Gc<T>`][crate::Gc] or [`Root<T>`][crate::Root])
@@ -660,7 +660,7 @@ impl Collector {
 /// heap[&p].1 = 5;
 /// ```
 ///
-/// ## When Can Garbage Collections Happen?
+/// # When Can Garbage Collections Happen?
 ///
 /// There are two ways to trigger garbage collection:
 ///
@@ -678,7 +678,7 @@ impl Collector {
 /// [`Root<T>`][crate::Root] must maintain its associated entry in the heap's
 /// root set.
 ///
-/// ## Cross-`Heap` GC References
+/// # Cross-`Heap` GC References
 ///
 /// Typically, GC objects will only reference other GC objects that are within
 /// the same `Heap`. In fact, edges reported to the [`Collector`] *must* point
