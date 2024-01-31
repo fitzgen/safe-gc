@@ -265,11 +265,7 @@ pub struct Heap {
     // A map from `type_id(T)` to `GcArena<T>`.
     arenas: HashMap<TypeId, Box<dyn ArenaObject>>,
 
-    // The copying collector.
-    //
-    // This is always `None` for the to-space heap that we are copying into, and
-    // `Some` for the from-space heap that we are copying out of.
-    collector: Option<Box<Collector>>,
+    collector: Collector,
 }
 
 impl Default for Heap {
@@ -337,22 +333,16 @@ where
 
 impl Heap {
     pub fn new() -> Self {
-        let mut heap = Heap::without_collector();
-        heap.collector = Some(Box::new(Collector::default()));
-        heap
+        Self {
+            id: Self::next_id(),
+            arenas: HashMap::default(),
+            collector: Collector::default(),
+        }
     }
 
     fn next_id() -> u32 {
         static ID_COUNTER: atomic::AtomicU32 = atomic::AtomicU32::new(0);
         ID_COUNTER.fetch_add(1, atomic::Ordering::AcqRel)
-    }
-
-    fn without_collector() -> Self {
-        Self {
-            id: Self::next_id(),
-            arenas: HashMap::default(),
-            collector: None,
-        }
     }
 
     fn arena<T>(&self) -> Option<&Arena<T>>
@@ -424,12 +414,11 @@ impl Heap {
     }
 
     pub fn gc(&mut self) {
-        let collector = self.collector.as_mut().unwrap();
-        debug_assert!(collector.mark_stacks.values().all(|s| s.is_empty()));
+        debug_assert!(self.collector.mark_stacks.values().all(|s| s.is_empty()));
 
         // Reset/pre-allocate the mark bits.
         for (ty, arena) in &self.arenas {
-            collector
+            self.collector
                 .mark_bits
                 .entry(*ty)
                 .or_default()
@@ -438,7 +427,7 @@ impl Heap {
 
         // Mark all roots.
         for arena in self.arenas.values() {
-            arena.trace_roots(collector);
+            arena.trace_roots(&mut self.collector);
         }
 
         // Mark everything transitively reachable from the roots.
@@ -446,18 +435,18 @@ impl Heap {
         // NB: We have a two-level fixed-point loop to avoid checking if every
         // mark stack is non-empty on every iteration of the hottest, inner-most
         // loop.
-        while let Some(type_id) = collector.next_non_empty_mark_stack() {
-            while let Some(index) = collector.pop_mark_stack(type_id) {
+        while let Some(type_id) = self.collector.next_non_empty_mark_stack() {
+            while let Some(index) = self.collector.pop_mark_stack(type_id) {
                 self.arenas
                     .get_mut(&type_id)
                     .unwrap()
-                    .trace_one(index, collector);
+                    .trace_one(index, &mut self.collector);
             }
         }
 
         // Sweep.
         for (ty, arena) in &mut self.arenas {
-            let mark_bits = &collector.mark_bits[ty];
+            let mark_bits = &self.collector.mark_bits[ty];
             arena.sweep(mark_bits);
         }
     }
