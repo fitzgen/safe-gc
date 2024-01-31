@@ -2,7 +2,7 @@
   <h1><code>safe-gc</code></h1>
   <p><strong>A garbage collection library for Rust without any <code>unsafe</code> code</strong></p>
   <p>
-    <a href="https://github.com/fitzgen/safe-gc/actions?query=workflow%3ACI"><img src="https://github.com/fitzgen/safe-gc/workflows/CI/badge.svg" alt="build status" /></a>
+    <a href="https://github.com/fitzgen/safe-gc/actions/workflows/rust.yml"><img src="https://github.com/fitzgen/safe-gc/actions/workflows/rust.yml/badge.svg" alt="build status" /></a>
     <a href="https://docs.rs/safe-gc"><img src="https://docs.rs/safe-gc/badge.svg" alt="Documentation Status" /></a>
   </p>
 </div>
