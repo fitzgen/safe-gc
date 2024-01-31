@@ -1,4 +1,6 @@
+#![doc = include_str!("../README.md")]
 #![forbid(unsafe_code)]
+#![deny(missing_docs)]
 
 mod free_list;
 mod mark_bits;
@@ -9,15 +11,164 @@ use std::{
     any::{Any, TypeId},
     cell::RefCell,
     collections::HashMap,
+    fmt::Debug,
     hash::Hash,
     rc::Rc,
     sync::atomic,
 };
 
+/// Report references to other GC-managed objects to the collector.
+///
+/// This trait must be implemented by all types that are allocated within a
+/// [`Heap`].
+///
+/// Failure to enumerate all edges in an instance will result in wacky -- but
+/// still safe! -- behavior: panics when attempting to access a collected
+/// object, accesses to a "wrong" object that's been allocated in place of the
+/// old object, etc...
+///
+/// # Example
+///
+/// ```
+/// use safe_gc::{Collector, Gc, Trace};
+///
+/// struct List<T: Trace> {
+///     value: Gc<T>,
+///     prev: Option<Gc<List<T>>>,
+///     next: Option<Gc<List<T>>>,
+/// }
+///
+/// impl<T: Trace> Trace for List<T> {
+///     fn trace(&self, collector: &mut Collector) {
+///         collector.edge(self.value);
+///         if let Some(prev) = self.prev {
+///             collector.edge(prev);
+///         }
+///         if let Some(next) = self.next {
+///             collector.edge(next);
+///         }
+///     }
+/// }
+/// ```
 pub trait Trace: Any {
+    /// Call `collector.edge(gc)` for each `Gc<T>` reference within `self`.
     fn trace(&self, collector: &mut Collector);
 }
 
+/// A reference to a garbage-collected `T`.
+///
+/// `Gc<T>` should be used when:
+///
+/// * Referencing other GC-managed objects from within a GC-managed object's
+///   type definition.
+///
+/// * Traversing or mutating GC-managed objects when you know a garbage
+///   collection cannot happen.
+///
+/// A `Gc<T>` does *not* root the referenced `T` or keep it alive across garbage
+/// collections. (The [`Root<T>`][crate::Root] type does that.) Therefore,
+/// `Gc<T>` should *not* be used to hold onto GC references across any operation
+/// that could trigger a garbage collection.
+///
+/// # Example: Referencing Other GC-Managed Objects Within a GC-Managed Object
+///
+/// ```
+/// use safe_gc::{Collector, Gc, Trace};
+///
+/// struct Tree<T: Trace> {
+///     // A non-nullable reference to a GC-managed `T`.
+///     value: Gc<T>,
+///
+///     // Nullable references to parent, left, and right tree nodes.
+///     parent: Option<Gc<Tree<T>>>,
+///     left: Option<Gc<Tree<T>>>,
+///     right: Option<Gc<Tree<T>>>,
+/// }
+///
+/// impl<T: Trace> Trace for Tree<T> {
+///     fn trace(&self, collector: &mut Collector) {
+///         // Report each of the `Gc<T>`s referenced from within `self` to the
+///         // collector. See the `Trace` docs for more details.
+///         collector.edge(self.value);
+///         if let Some(parent) = self.parent {
+///             collector.edge(parent);
+///         }
+///         if let Some(left) = self.left {
+///             collector.edge(left);
+///         }
+///         if let Some(right) = self.right {
+///             collector.edge(right);
+///         }
+///     }
+/// }
+/// ```
+///
+/// # Example: Accessing a `Gc<T>`'s referenced `T`
+///
+/// ```
+/// use safe_gc::{Gc, Heap, Trace};
+///
+/// struct Node {
+///     value: u32,
+///     tail: Option<Gc<Node>>,
+/// }
+///
+/// impl Trace for Node {
+///     // ...
+/// #   fn trace(&self, _: &mut safe_gc::Collector) {}
+/// }
+///
+/// let mut heap = Heap::new();
+///
+/// let a = heap.alloc(Node { value: 36, tail: None });
+/// let b = heap.alloc(Node { value: 42, tail: Some(a.into()) });
+/// let c = heap.alloc(Node { value: 99, tail: Some(b.clone().into()) });
+///
+/// // Read `(*c).tail`.
+/// let c_tail = heap[&c].tail;
+/// assert_eq!(c_tail, Some(b.into()));
+///
+/// // Write `(*c).tail = None`.
+/// heap[&c].tail = None;
+/// ```
+///
+/// # Example: Downgrading a `Root<T>` into a `Gc<T>`
+///
+/// The [`Heap::alloc`] method returns rooted references, but to store those
+/// references into the field of a GC-managed object, you'll need to unroot the
+/// reference with [`Root<T>::unrooted`][crate::Root::unrooted]. (You can also
+/// use `root.into()` or `Gc::from(root)`.)
+///
+/// ```
+/// use safe_gc::{Gc, Heap, Root, Trace};
+///
+/// struct Cat {
+///     siblings: Vec<Gc<Cat>>,
+/// }
+///
+/// impl Trace for Cat {
+///     // ...
+/// #   fn trace(&self, _: &mut safe_gc::Collector) {}
+/// }
+///
+/// let mut heap = Heap::new();
+///
+/// let momo: Root<Cat> = heap.alloc(Cat { siblings: vec![] });
+/// let juno: Root<Cat> = heap.alloc(Cat { siblings: vec![] });
+///
+/// // Add `momo` and `juno` to each other's siblings vectors. This requires
+/// // downgrading the `Root<Cat>`s to `Gc<Cat>`s via the `unrooted` method.
+/// heap[&momo].siblings.push(juno.unrooted());
+/// heap[&juno].siblings.push(momo.unrooted());
+/// ```
+///
+/// # Example: Upgrading a `Gc<T>` into a `Root<T>`
+///
+/// You can upgrade a `Gc<T>` into a [`Root<T>`][crate::Root] via the
+/// [`Heap::root`] method, so that you can hold references to GC-objects across
+/// operations that can potentially trigger garbage collections.
+///
+/// See the docs for [`Heap::root`] for more details and an example.
 pub struct Gc<T> {
     heap_id: u32,
     index: u32,
@@ -32,6 +183,15 @@ impl<T> Clone for Gc<T> {
 
 impl<T> Copy for Gc<T> {}
 
+impl<T> Debug for Gc<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct(&format!("Gc<{}>", std::any::type_name::<T>()))
+            .field("heap_id", &self.heap_id)
+            .field("index", &self.index)
+            .finish()
+    }
+}
+
 impl<T> Hash for Gc<T> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.heap_id.hash(state);
@@ -39,13 +199,40 @@ impl<T> Hash for Gc<T> {
     }
 }
 
-impl<T> PartialEq for Gc<T> {
+impl<T> PartialEq<Self> for Gc<T> {
     fn eq(&self, other: &Self) -> bool {
         self.heap_id == other.heap_id && self.index == other.index
     }
 }
 
+impl<T> PartialEq<Root<T>> for Gc<T>
+where
+    T: Trace,
+{
+    fn eq(&self, other: &Root<T>) -> bool {
+        *self == other.unrooted()
+    }
+}
+
 impl<T> Eq for Gc<T> {}
+
+impl<T> From<Root<T>> for Gc<T>
+where
+    T: Trace,
+{
+    fn from(root: Root<T>) -> Self {
+        root.unrooted()
+    }
+}
+
+impl<'a, T> From<&'a Root<T>> for Gc<T>
+where
+    T: Trace,
+{
+    fn from(root: &'a Root<T>) -> Self {
+        root.unrooted()
+    }
+}
 
 struct RootSet<T> {
     inner: Rc<RefCell<FreeList<Gc<T>>>>,
@@ -93,6 +280,41 @@ where
     }
 }
 
+/// A rooted reference to a GC-managed `T`.
+///
+/// `Root<T>`s prevent their referenced `T` from being reclaimed during garbage
+/// collections. This makes them suitable for holding references to GC-managed
+/// objects across operations that can trigger GCs.
+///
+/// `Root<T>`s are *not* suitable for referencing other GC-manged objects within
+/// the definition of a GC-managed object. Doing this will effectively leak
+/// everything transitively referenced from the `Root<T>`. Instead, use
+/// [`Gc<T>`][crate::Gc] for references to other GC-managed objects from within
+/// a GC-managed object.
+///
+/// See also the docs for [`Gc<T>`][crate::Gc] for more examples of converting
+/// between `Root<T>` and `Gc<T>` and when you want to use which type.
+///
+/// # Example: Creating a `Root<T>` via Allocation
+///
+/// ```
+/// use safe_gc::{Gc, Heap, Root, Trace};
+///
+/// struct Node {
+///     value: u32,
+///     tail: Option<Gc<Node>>,
+/// }
+///
+/// impl Trace for Node {
+///     // ...
+/// #   fn trace(&self, _: &mut safe_gc::Collector) {}
+/// }
+///
+/// let mut heap = Heap::new();
+///
+/// // Allocating a new GC object in a heap returns a `Root<T>` reference.
+/// let node: Root<Node> = heap.alloc(Node { value: 1234, tail: None });
+/// ```
 pub struct Root<T>
 where
     T: Trace,
@@ -110,6 +332,24 @@ where
     }
 }
 
+impl<T> PartialEq<Root<T>> for Root<T>
+where
+    T: Trace,
+{
+    fn eq(&self, other: &Root<T>) -> bool {
+        self.unrooted() == other.unrooted()
+    }
+}
+
+impl<T> PartialEq<Gc<T>> for Root<T>
+where
+    T: Trace,
+{
+    fn eq(&self, other: &Gc<T>) -> bool {
+        self.unrooted() == *other
+    }
+}
+
 impl<T> Drop for Root<T>
 where
     T: Trace,
@@ -123,6 +363,12 @@ impl<T> Root<T>
 where
     T: Trace,
 {
+    /// Get an unrooted [`Gc<T>`][crate::Gc] reference pointing to the same `T`
+    /// that this `Root<T>` points to.
+    ///
+    /// See also the docs for [`Gc<T>`][crate::Gc] for more examples of
+    /// converting between `Root<T>` and `Gc<T>` and when you want to use which
+    /// type.
     pub fn unrooted(&self) -> Gc<T> {
         let inner = (*self.roots.inner).borrow();
         *inner.get(self.index)
@@ -230,17 +476,48 @@ where
     }
 }
 
-#[derive(Default)]
+/// The garbage collector for a heap.
+///
+/// GC-managed objects should report all of their references to other GC-managed
+/// objects (aka "edges") to the collector in their [`Trace`] implementations.
+///
+/// See the docs for [`Trace`] for more information.
+//
+// This type is only exposed to users so they can report edges, but internally
+// this does a bit more than that:
+//
+// * It maintains the mark stack work lists that contain all the GC objects
+//   we've seen but have not yet finished processing.
+//
+// * It maintains the mark bits for all GC objects in the heap, which keep track
+//   of which GC objects we have and have not seen while tracing the live set.
 pub struct Collector {
+    heap_id: u32,
     mark_stacks: HashMap<TypeId, Vec<u32>>,
     mark_bits: HashMap<TypeId, MarkBits>,
 }
 
 impl Collector {
+    fn new(heap_id: u32) -> Self {
+        Self {
+            heap_id,
+            mark_stacks: HashMap::default(),
+            mark_bits: HashMap::default(),
+        }
+    }
+
+    /// Report a reference to another GC-managed object (aka an "edge" in the
+    /// heap graph).
+    ///
+    /// See the docs for [`Trace`] for more information.
+    ///
+    /// Panics when given cross-heap edges. See the "Cross-`Heap` GC References"
+    /// section of [`Heap`]'s documentation for details on cross-heap edges.
     pub fn edge<T>(&mut self, to: Gc<T>)
     where
         T: Trace,
     {
+        assert_eq!(to.heap_id, self.heap_id);
         let ty = TypeId::of::<T>();
         let mark_bits = self.mark_bits.get_mut(&ty).unwrap();
         if mark_bits.set(to.index) {
@@ -267,6 +544,169 @@ impl Collector {
     }
 }
 
+/// A collection of GC-managed objects.
+///
+/// A `Heap` is a collection of GC-managed objects that can all reference each
+/// other, and garbage collection is performed at the `Heap` granularity. The
+/// smaller the `Heap`, the less overhead imposed by garbage collecting it. The
+/// larger the `Heap`, the more overhead is imposed.
+///
+/// There are no restrictions on the shape of references between GC-managed
+/// objects within a `Heap`: references may form arbitrary cycles and there is
+/// no imposed ownership hierarchy.
+///
+/// ## Allocating Objects
+///
+/// You can allocate objects with the [`Heap::alloc`] method.
+///
+/// You can allocate instances of any number of heterogeneous types of
+/// GC-managed objects within a `Heap`: they may, for example, contain both
+/// `Cons` objects and `Tree` objects. `Heap`s are *not* constrained to only
+/// instances of a single, uniform `T` type of GC objects.
+///
+/// All types allocated within a heap must, however, implement the [`Trace`]
+/// trait. See the [`Trace`] trait's docs for more details.
+///
+/// ```
+/// use safe_gc::{Gc, Heap, Trace};
+///
+/// struct Tree<T: Trace> {
+///     value: Gc<T>,
+///     parent: Option<Gc<Tree<T>>>,
+///     left: Option<Gc<Tree<T>>>,
+///     right: Option<Gc<Tree<T>>>,
+/// }
+///
+/// impl<T: Trace> Trace for Tree<T> {
+///     // See the docs for `Trace` for details...
+/// #   fn trace(&self, _: &mut safe_gc::Collector) {}
+/// }
+///
+/// struct Cat {
+///     cuteness: u32,
+///     cat_tree: Option<Gc<Tree<Cat>>>,
+/// }
+///
+/// impl Trace for Cat {
+///     // See the docs for `Trace` for details...
+/// #   fn trace(&self, _: &mut safe_gc::Collector) {}
+/// }
+///
+/// let mut heap = Heap::new();
+///
+/// // Allocate a cat within the heap!
+/// let goomba = heap.alloc(Cat {
+///     cuteness: u32::MAX,
+///     cat_tree: None,
+/// });
+///
+/// // Also allocate a tree within the heap!
+/// let tree = heap.alloc(Tree {
+///     value: goomba.unrooted(),
+///     parent: None,
+///     left: None,
+///     right: None,
+/// });
+///
+/// // Create a cycle: the `tree` already references `goomba`, but now
+/// // `goomba` references the `tree` as well.
+/// heap[goomba].cat_tree = Some(tree.into());
+/// ```
+///
+/// ## Accessing Allocating Objects
+///
+/// Rather than dereferencing pointers to allocated GC objects directly, you
+/// must use one of two types ([`Gc<T>`][crate::Gc] or [`Root<T>`][crate::Root])
+/// to index into the `Heap` to access the referenced `T` object. This enables
+/// `safe-gc`'s lack of `unsafe` code and allows the implementation to follow
+/// Rust's ownership and borrowing discipline.
+///
+/// Given a [`Gc<T>`][crate::Gc] or [`Root<T>`][crate::Root], you can use the
+/// [`Heap::get`] method to get an `&T`. Similarly, you can use the
+/// [`Heap::get_mut`] method to get an `&mut T`. As convenient syntactic sugar,
+/// `Heap` also implements [`std::ops::Index`] and [`std::ops::IndexMut`] as
+/// aliases for `get` and `get_mut` respectively.
+///
+/// The [`Gc<T>`][crate::Gc] index type is an unrooted reference, suitable for
+/// defining references to other GC-managed types within a GC-managed type's
+/// definition.
+///
+/// The [`Root<T>`][crate::Root] index type is a rooted reference, prevents its
+/// referent from being reclaimed during garbage collections, and is suitable
+/// for holding GC-managed objects alive from outside of the `Heap`.
+///
+/// See the docs for [`Gc<T>`][crate::Gc] and [`Root<T>`][crate::Root] for more
+/// details, how to convert between them, and other examples.
+///
+/// ```
+/// use safe_gc::{Heap, Trace};
+///
+/// struct Point(u32, u32);
+///
+/// impl Trace for Point {
+///     // ...
+/// #   fn trace(&self, _: &mut safe_gc::Collector) {}
+/// }
+///
+/// let mut heap = Heap::new();
+///
+/// let p = heap.alloc(Point(42, 36));
+///
+/// // Read data from an object in the heap.
+/// let p0 = heap[&p].0;
+/// assert_eq!(p0, 42);
+///
+/// // Write data to an object in the heap.
+/// heap[&p].1 = 5;
+/// ```
+///
+/// ## When Can Garbage Collections Happen?
+///
+/// There are two ways to trigger garbage collection:
+///
+/// 1. When the [`Heap::gc`] method is explicitly invoked.
+///
+/// 2. When allocating an object in the heap with [`Heap::alloc`].
+///
+/// Note that both of those methods require an `&mut self`, so they cannot be
+/// invoked when there are shared `&Heap` borrows. Therefore, when there are
+/// shared `&Heap` borrows, you may freely use [`Gc<T>`][crate::Gc] instead of
+/// [`Root<T>`][crate::Root] to hold references to objects in the heap without
+/// fear of the GC collecting the objects out from under your feet. Traversing
+/// deeply nested structures will have more overhead when using
+/// [`Root<T>`][crate::Root] than when using [`Gc<T>`][crate::Gc] because
+/// [`Root<T>`][crate::Root] must maintain its associated entry in the heap's
+/// root set.
+///
+/// ## Cross-`Heap` GC References
+///
+/// Typically, GC objects will only reference other GC objects that are within
+/// the same `Heap`. In fact, edges reported to the [`Collector`] *must* point
+/// to objects within the same `Heap` as the object being traced or else
+/// [`Collector::edge`] will raise a panic.
+///
+/// However, you can create cross-heap edges with [`Root<T>`][crate::Root], but
+/// it requires some care. While a [`Root<T>`][crate::Root] pointing to an
+/// object in the same `Heap` will make all transitively referenced objects
+/// unreclaimable, a [`Root<T>`][crate::Root] pointing to an object in another
+/// heap will not indefinitely leak memory, provided you do not create *cycles*
+/// across `Heap`s. To fully collect all garbage across all `Heap`s, you will
+/// need to run GC on each `Heap` either
+///
+/// * in topological order of cross-`Heap` edges, if you statically know that
+///   order in your application, or
+///
+/// * in a fixed point loop, if you do not statically know that order.
+///
+/// However, if you don't statically know that topological order, it is
+/// recommended that you don't create cross-`Heap` edges; you will likely
+/// accidentally create cycles and leak memory. Instead, simply put everything
+/// in the same `Heap`.
+///
+/// Collecting cycles across `Heap`s would require a global, cross-`Heap`
+/// collector, and is not a goal of this crate. If you do choose to create
+/// cross-`Heap` references, the responsibility of avoiding cross-`Heap` cycles
+/// is yours.
 pub struct Heap {
     // The unique ID for this heap. Used to ensure that `Gc<T>`s are only used
     // with their associated arena. Could use branded lifetimes to avoid these
@@ -274,7 +714,7 @@ pub struct Heap {
     // everything.
     id: u32,
 
-    // A map from `type_id(T)` to `GcArena<T>`.
+    // A map from `type_id(T)` to `Arena<T>`.
     arenas: HashMap<TypeId, Box<dyn ArenaObject>>,
 
     collector: Collector,
@@ -344,12 +784,22 @@ where
 }
 
 impl Heap {
+    /// Construct a new `Heap`.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use safe_gc::Heap;
+    ///
+    /// let heap = Heap::new();
+    /// ```
     #[inline]
     pub fn new() -> Self {
+        let id = Self::next_id();
         Self {
-            id: Self::next_id(),
+            id,
             arenas: HashMap::default(),
-            collector: Collector::default(),
+            collector: Collector::new(id),
         }
     }
 
@@ -390,6 +840,33 @@ impl Heap {
             .unwrap()
     }
 
+    /// Allocate an object in the heap.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use safe_gc::{Gc, Heap, Trace};
+    ///
+    /// struct List {
+    ///     value: u32,
+    ///     prev: Option<Gc<List>>,
+    ///     next: Option<Gc<List>>,
+    /// }
+    ///
+    /// impl Trace for List {
+    ///     // See the docs for `Trace` for details...
+    /// #   fn trace(&self, _: &mut safe_gc::Collector) {}
+    /// }
+    ///
+    /// let mut heap = Heap::new();
+    ///
+    /// // Allocate an object in the heap.
+    /// let list = heap.alloc(List {
+    ///     value: 10,
+    ///     prev: None,
+    ///     next: None,
+    /// });
+    /// ```
     #[inline]
     pub fn alloc<T>(&mut self, value: T) -> Root<T>
     where
@@ -416,26 +893,139 @@ impl Heap {
         arena.alloc_slow(heap_id, value)
     }
 
+    /// Get a shared reference to an allocated object in the heap.
+    ///
+    /// You can also use [`std::ops::Index`] to access objects in the heap.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use safe_gc::{Gc, Heap, Trace};
+    ///
+    /// struct List {
+    ///     value: u32,
+    ///     prev: Option<Gc<List>>,
+    ///     next: Option<Gc<List>>,
+    /// }
+    ///
+    /// impl Trace for List {
+    ///     // See the docs for `Trace` for details...
+    /// #   fn trace(&self, _: &mut safe_gc::Collector) {}
+    /// }
+    ///
+    /// let mut heap = Heap::new();
+    ///
+    /// // Allocate an object in the heap.
+    /// let list = heap.alloc(List {
+    ///     value: 10,
+    ///     prev: None,
+    ///     next: None,
+    /// });
+    ///
+    /// // Access an allocated object in the heap.
+    /// let value = heap.get(list).value;
+    /// assert_eq!(value, 10);
+    /// ```
     #[inline]
-    pub fn get<T>(&self, gc: Gc<T>) -> &T
+    pub fn get<T>(&self, gc: impl Into<Gc<T>>) -> &T
     where
         T: Trace,
     {
+        let gc = gc.into();
         assert_eq!(self.id, gc.heap_id);
         let arena = self.arena::<T>().unwrap();
         arena.elements.get(gc.index)
     }
 
+    /// Get a shared reference to an allocated object in the heap.
+    ///
+    /// You can also use [`std::ops::Index`] to access objects in the heap.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use safe_gc::{Gc, Heap, Trace};
+    ///
+    /// struct List {
+    ///     value: u32,
+    ///     prev: Option<Gc<List>>,
+    ///     next: Option<Gc<List>>,
+    /// }
+    ///
+    /// impl Trace for List {
+    ///     // See the docs for `Trace` for details...
+    /// #   fn trace(&self, _: &mut safe_gc::Collector) {}
+    /// }
+    ///
+    /// let mut heap = Heap::new();
+    ///
+    /// // Allocate an object in the heap.
+    /// let list = heap.alloc(List {
+    ///     value: 10,
+    ///     prev: None,
+    ///     next: None,
+    /// });
+    ///
+    /// // Mutate an allocated object in the heap.
+    /// heap.get_mut(&list).value += 1;
+    /// assert_eq!(heap[list].value, 11);
+    /// ```
     #[inline]
-    pub fn get_mut<T>(&mut self, gc: Gc<T>) -> &mut T
+    pub fn get_mut<T>(&mut self, gc: impl Into<Gc<T>>) -> &mut T
     where
         T: Trace,
     {
+        let gc = gc.into();
         assert_eq!(self.id, gc.heap_id);
         let arena = self.arena_mut::<T>().unwrap();
         arena.elements.get_mut(gc.index)
     }
 
+    /// Root a reference to a GC object.
+    ///
+    /// This method upgrades a [`Gc<T>`][crate::Gc] into a
+    /// [`Root<T>`][crate::Root]. This is useful for holding references to
+    /// GC-managed objects across operations that can potentially trigger
+    /// garbage collections, making sure that the collector doesn't reclaim them
+    /// from under your feed.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use safe_gc::{Gc, Heap, Root, Trace};
+    ///
+    /// struct Node {
+    ///     value: u32,
+    ///     tail: Option<Gc<Node>>,
+    /// }
+    ///
+    /// impl Trace for Node {
+    ///     // See the docs for `Trace` for details...
+    /// #   fn trace(&self, _: &mut safe_gc::Collector) {}
+    /// }
+    ///
+    /// let mut heap = Heap::new();
+    ///
+    /// let a = heap.alloc(Node { value: 0, tail: None });
+    /// let b = heap.alloc(Node { value: 1, tail: Some(a.into()) });
+    ///
+    /// // Get a reference to a `Gc<T>` from the heap.
+    /// let b_tail: Gc<Node> = heap[b].tail.unwrap();
+    ///
+    /// // Upgrade the `Gc<T>` to a `Root<T>` via the `Heap::root` method so it is
+    /// // suitable for holding across garbage collections.
+    /// let b_tail: Root<Node> = heap.root(b_tail);
+    ///
+    /// // Now we can perform operations, like heap allocation, that might GC
+    /// // without worrying about `b_tail`'s referenced GC object from being
+    /// // collected out from under us.
+    /// heap.alloc(Node { value: 123, tail: None });
+    ///
+    /// // And we can access `b_tail`'s referenced GC object again, after GC may
+    /// // have happened.
+    /// let b_tail_value = heap[&b_tail].value;
+    /// assert_eq!(b_tail_value, 0);
+    /// ```
     #[inline]
     pub fn root<T>(&self, gc: Gc<T>) -> Root<T>
     where
@@ -446,6 +1036,24 @@ impl Heap {
         arena.root(gc)
     }
 
+    /// Collect garbage.
+    ///
+    /// Any object in the heap that is not transitively referenced by a
+    /// [`Root<T>`][crate::Root] will be reclaimed.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use safe_gc::Heap;
+    ///
+    /// let mut heap = Heap::new();
+    ///
+    /// # let allocate_a_bunch_of_stuff = |_| {};
+    /// allocate_a_bunch_of_stuff(&mut heap);
+    ///
+    /// // Collect garbage!
+    /// heap.gc();
+    /// ```
     #[inline(never)]
     pub fn gc(&mut self) {
         debug_assert!(self.collector.mark_stacks.values().all(|s| s.is_empty()));
