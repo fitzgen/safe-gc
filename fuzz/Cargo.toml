@@ -1,0 +1,22 @@
+[package]
+name = "safe-gc-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+safe-gc = { path = ".." }
+safe-gc-mutator = { path = "../crates/mutator" }
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "mutator"
+path = "./mutator.rs"
+test = false
+doc = false

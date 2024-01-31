@@ -1,13 +1,22 @@
 #![forbid(unsafe_code)]
 
+mod free_list;
+mod mark_bits;
+
+use free_list::FreeList;
+use mark_bits::MarkBits;
 use std::{
     any::{Any, TypeId},
-    cell::{Ref, RefCell},
+    cell::RefCell,
     collections::HashMap,
     hash::Hash,
     rc::Rc,
     sync::atomic,
 };
+
+pub trait Trace: Any {
+    fn trace(&self, collector: &mut Collector);
+}
 
 pub struct Gc<T> {
     heap_id: u32,
@@ -38,32 +47,11 @@ impl<T> PartialEq for Gc<T> {
 
 impl<T> Eq for Gc<T> {}
 
-enum FreeListEntry<T> {
-    Free { next_free: Option<u32> },
-    Occupied { gc: Gc<T> },
+struct RootSet<T> {
+    inner: Rc<RefCell<FreeList<Gc<T>>>>,
 }
 
-struct GcRootSetInner<T> {
-    entries: Vec<FreeListEntry<T>>,
-
-    // The index of the first free entry in the free list.
-    free: Option<u32>,
-}
-
-impl<T> Default for GcRootSetInner<T> {
-    fn default() -> Self {
-        Self {
-            entries: Vec::default(),
-            free: None,
-        }
-    }
-}
-
-struct GcRootSet<T> {
-    inner: Rc<RefCell<GcRootSetInner<T>>>,
-}
-
-impl<T> Clone for GcRootSet<T> {
+impl<T> Clone for RootSet<T> {
     fn clone(&self) -> Self {
         Self {
             inner: Rc::clone(&self.inner),
@@ -71,77 +59,72 @@ impl<T> Clone for GcRootSet<T> {
     }
 }
 
-impl<T> Default for GcRootSet<T> {
+impl<T> Default for RootSet<T> {
     fn default() -> Self {
         Self {
-            inner: Rc::new(RefCell::new(GcRootSetInner::<T>::default())),
+            inner: Rc::new(RefCell::new(FreeList::<Gc<T>>::default())),
         }
     }
 }
 
-impl<T> GcRootSet<T> {
-    fn insert(&self, gc: Gc<T>) -> GcRoot<T> {
+impl<T> RootSet<T>
+where
+    T: Trace,
+{
+    fn insert(&self, gc: Gc<T>) -> Root<T> {
         let mut inner = self.inner.borrow_mut();
-
-        let index = if let Some(index) = inner.free {
-            let index = usize::try_from(index).unwrap();
-            let next_free = match inner.entries[index] {
-                FreeListEntry::Free { next_free } => next_free,
-                FreeListEntry::Occupied { .. } => unreachable!(),
-            };
-            inner.free = next_free;
-            inner.entries[index] = FreeListEntry::Occupied { gc };
-            index
-        } else {
-            let index = inner.entries.len();
-            inner.entries.push(FreeListEntry::Occupied { gc });
-            index
-        };
-
-        GcRoot {
+        let index = inner.alloc(gc);
+        Root {
             roots: self.clone(),
             index,
         }
     }
 
-    fn remove(&self, index: usize) {
+    fn remove(&self, index: u32) {
         let mut inner = self.inner.borrow_mut();
-        debug_assert!(matches!(
-            inner.entries[index],
-            FreeListEntry::Occupied { .. }
-        ));
-        inner.entries[index] = FreeListEntry::Free {
-            next_free: inner.free,
-        };
-        let index = u32::try_from(index).unwrap();
-        inner.free = Some(index);
+        inner.dealloc(index);
+    }
+
+    fn trace(&self, collector: &mut Collector) {
+        let inner = self.inner.borrow();
+        for (_, gc) in inner.iter() {
+            collector.edge(*gc);
+        }
     }
 }
 
-pub struct GcRoot<T> {
-    roots: GcRootSet<T>,
-    index: usize,
+pub struct Root<T>
+where
+    T: Trace,
+{
+    roots: RootSet<T>,
+    index: u32,
 }
 
-impl<T> Drop for GcRoot<T> {
+// TODO: impl clone
+
+impl<T> Drop for Root<T>
+where
+    T: Trace,
+{
     fn drop(&mut self) {
         self.roots.remove(self.index);
     }
 }
 
-impl<T> GcRoot<T> {
-    fn as_gc(&self) -> Gc<T> {
-        let inner: Ref<_> = (*self.roots.inner).borrow();
-        match inner.entries[self.index] {
-            FreeListEntry::Occupied { gc } => gc,
-            FreeListEntry::Free { .. } => unreachable!(),
-        }
+impl<T> Root<T>
+where
+    T: Trace,
+{
+    pub fn unrooted(&self) -> Gc<T> {
+        let inner = (*self.roots.inner).borrow();
+        *inner.get(self.index)
     }
 }
 
-struct GcArena<T> {
-    roots: GcRootSet<T>,
-    elements: Vec<T>,
+struct Arena<T> {
+    roots: RootSet<T>,
+    elements: FreeList<T>,
 }
 
 // We don't default to 0-capacity arenas because the arenas themselves are
@@ -149,40 +132,35 @@ struct GcArena<T> {
 // always immediately push onto it.
 const DEFAULT_ARENA_CAPACITY: usize = 32;
 
-impl<T> Default for GcArena<T> {
+impl<T> Default for Arena<T> {
     fn default() -> Self {
-        GcArena {
-            roots: GcRootSet::<T>::default(),
-            elements: Vec::with_capacity(DEFAULT_ARENA_CAPACITY),
+        Arena {
+            roots: RootSet::<T>::default(),
+            elements: FreeList::with_capacity(DEFAULT_ARENA_CAPACITY),
         }
     }
 }
 
-impl<T> GcArena<T> {
+impl<T> Arena<T>
+where
+    T: Trace,
+{
     #[inline]
-    fn try_alloc(&mut self, heap_id: u32, value: T) -> Result<GcRoot<T>, T> {
-        if self.elements.len() < self.elements.capacity() {
-            let index = self.elements.len();
-            let index = u32::try_from(index).unwrap();
-            self.elements.push(value);
-            Ok(self.roots.insert(Gc {
-                heap_id,
-                index,
-                _phantom: std::marker::PhantomData,
-            }))
-        } else {
-            Err(value)
-        }
+    fn try_alloc(&mut self, heap_id: u32, value: T) -> Result<Root<T>, T> {
+        let index = self.elements.try_alloc(value)?;
+        Ok(self.roots.insert(Gc {
+            heap_id,
+            index,
+            _phantom: std::marker::PhantomData,
+        }))
     }
 
-    fn alloc_slow(&mut self, heap_id: u32, value: T) -> GcRoot<T> {
+    fn alloc_slow(&mut self, heap_id: u32, value: T) -> Root<T> {
         if self.elements.len() == self.elements.capacity() {
             let additional = self.elements.len();
             self.elements.reserve(additional);
         }
-        let index = self.elements.len();
-        let index = u32::try_from(index).unwrap();
-        self.elements.push(value);
+        let index = self.elements.try_alloc(value).ok().unwrap();
         self.roots.insert(Gc {
             heap_id,
             index,
@@ -191,7 +169,93 @@ impl<T> GcArena<T> {
     }
 }
 
-pub struct GcHeap {
+trait ArenaObject: Any {
+    fn as_any(&self) -> &dyn Any;
+
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+
+    fn trace_roots(&self, collector: &mut Collector);
+
+    fn trace_one(&mut self, index: u32, collector: &mut Collector);
+
+    fn capacity(&self) -> usize;
+
+    fn sweep(&mut self, mark_bits: &MarkBits);
+}
+
+impl<T> ArenaObject for Arena<T>
+where
+    T: Trace,
+{
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+
+    fn trace_roots(&self, collector: &mut Collector) {
+        self.roots.trace(collector);
+    }
+
+    fn trace_one(&mut self, index: u32, collector: &mut Collector) {
+        self.elements.get(index).trace(collector);
+    }
+
+    fn capacity(&self) -> usize {
+        self.elements.capacity()
+    }
+
+    fn sweep(&mut self, mark_bits: &MarkBits) {
+        let capacity = self.elements.capacity();
+        let capacity = u32::try_from(capacity).unwrap();
+        for index in 0..capacity {
+            if !mark_bits.get(index) {
+                self.elements.dealloc(index);
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct Collector {
+    mark_stacks: HashMap<TypeId, Vec<u32>>,
+    mark_bits: HashMap<TypeId, MarkBits>,
+}
+
+impl Collector {
+    pub fn edge<T>(&mut self, to: Gc<T>)
+    where
+        T: Trace,
+    {
+        let ty = TypeId::of::<T>();
+        let mark_bits = self.mark_bits.get_mut(&ty).unwrap();
+        if mark_bits.set(to.index) {
+            return;
+        }
+        let mark_stack = self.mark_stacks.entry(ty).or_default();
+        mark_stack.push(to.index);
+    }
+
+    fn next_non_empty_mark_stack(&self) -> Option<TypeId> {
+        self.mark_stacks.iter().find_map(
+            |(ty, stack)| {
+                if stack.is_empty() {
+                    None
+                } else {
+                    Some(*ty)
+                }
+            },
+        )
+    }
+
+    fn pop_mark_stack(&mut self, type_id: TypeId) -> Option<u32> {
+        self.mark_stacks.get_mut(&type_id).unwrap().pop()
+    }
+}
+
+pub struct Heap {
     // The unique ID for this heap. Used to ensure that `Gc<T>`s are only used
     // with their associated arena. Could use branded lifetimes to avoid these
     // IDs and checks statically, but the API is gross and pushes lifetimes into
@@ -199,37 +263,62 @@ pub struct GcHeap {
     id: u32,
 
     // A map from `type_id(T)` to `GcArena<T>`.
-    arenas: HashMap<TypeId, Box<dyn Any>>,
+    arenas: HashMap<TypeId, Box<dyn ArenaObject>>,
+
+    // The copying collector.
+    //
+    // This is always `None` for the to-space heap that we are copying into, and
+    // `Some` for the from-space heap that we are copying out of.
+    collector: Option<Box<Collector>>,
 }
 
-impl Default for GcHeap {
+impl Default for Heap {
     fn default() -> Self {
-        GcHeap::new()
+        Heap::new()
     }
 }
 
-impl<T> std::ops::Index<GcRoot<T>> for GcHeap
+impl<T> std::ops::Index<Root<T>> for Heap
 where
-    T: Any,
+    T: Trace,
 {
     type Output = T;
-    fn index(&self, root: GcRoot<T>) -> &Self::Output {
-        &self[root.as_gc()]
+    fn index(&self, root: Root<T>) -> &Self::Output {
+        &self[root.unrooted()]
     }
 }
 
-impl<T> std::ops::IndexMut<GcRoot<T>> for GcHeap
+impl<T> std::ops::IndexMut<Root<T>> for Heap
 where
-    T: Any,
+    T: Trace,
 {
-    fn index_mut(&mut self, root: GcRoot<T>) -> &mut Self::Output {
-        &mut self[root.as_gc()]
+    fn index_mut(&mut self, root: Root<T>) -> &mut Self::Output {
+        &mut self[root.unrooted()]
     }
 }
 
-impl<T> std::ops::Index<Gc<T>> for GcHeap
+impl<'a, T> std::ops::Index<&'a Root<T>> for Heap
 where
-    T: Any,
+    T: Trace,
+{
+    type Output = T;
+    fn index(&self, root: &'a Root<T>) -> &Self::Output {
+        &self[root.unrooted()]
+    }
+}
+
+impl<'a, T> std::ops::IndexMut<&'a Root<T>> for Heap
+where
+    T: Trace,
+{
+    fn index_mut(&mut self, root: &'a Root<T>) -> &mut Self::Output {
+        &mut self[root.unrooted()]
+    }
+}
+
+impl<T> std::ops::Index<Gc<T>> for Heap
+where
+    T: Trace,
 {
     type Output = T;
     fn index(&self, index: Gc<T>) -> &Self::Output {
@@ -237,53 +326,66 @@ where
     }
 }
 
-impl<T> std::ops::IndexMut<Gc<T>> for GcHeap
+impl<T> std::ops::IndexMut<Gc<T>> for Heap
 where
-    T: Any,
+    T: Trace,
 {
     fn index_mut(&mut self, gc: Gc<T>) -> &mut Self::Output {
         self.get_mut(gc)
     }
 }
 
-impl GcHeap {
+impl Heap {
     pub fn new() -> Self {
-        static ID_COUNTER: atomic::AtomicU32 = atomic::AtomicU32::new(0);
-        let id = ID_COUNTER.fetch_add(1, atomic::Ordering::AcqRel);
-        let arenas = HashMap::default();
-        Self { id, arenas }
+        let mut heap = Heap::without_collector();
+        heap.collector = Some(Box::new(Collector::default()));
+        heap
     }
 
-    fn arena<T>(&self) -> Option<&GcArena<T>>
+    fn next_id() -> u32 {
+        static ID_COUNTER: atomic::AtomicU32 = atomic::AtomicU32::new(0);
+        ID_COUNTER.fetch_add(1, atomic::Ordering::AcqRel)
+    }
+
+    fn without_collector() -> Self {
+        Self {
+            id: Self::next_id(),
+            arenas: HashMap::default(),
+            collector: None,
+        }
+    }
+
+    fn arena<T>(&self) -> Option<&Arena<T>>
     where
-        T: Any,
+        T: Trace,
     {
         let arena = self.arenas.get(&TypeId::of::<T>())?;
-        Some(arena.downcast_ref().unwrap())
+        Some(arena.as_any().downcast_ref().unwrap())
     }
 
-    fn arena_mut<T>(&mut self) -> Option<&mut GcArena<T>>
+    fn arena_mut<T>(&mut self) -> Option<&mut Arena<T>>
     where
-        T: Any,
+        T: Trace,
     {
         let arena = self.arenas.get_mut(&TypeId::of::<T>())?;
-        Some(arena.downcast_mut().unwrap())
+        Some(arena.as_any_mut().downcast_mut().unwrap())
     }
 
-    fn ensure_arena<T>(&mut self) -> &mut GcArena<T>
+    fn ensure_arena<T>(&mut self) -> &mut Arena<T>
     where
-        T: Any,
+        T: Trace,
     {
         self.arenas
             .entry(TypeId::of::<T>())
-            .or_insert_with(|| Box::new(GcArena::<T>::default()) as Box<dyn Any>)
+            .or_insert_with(|| Box::new(Arena::<T>::default()) as _)
+            .as_any_mut()
             .downcast_mut()
             .unwrap()
     }
 
-    pub fn alloc<T>(&mut self, value: T) -> GcRoot<T>
+    pub fn alloc<T>(&mut self, value: T) -> Root<T>
     where
-        T: Any,
+        T: Trace,
     {
         let heap_id = self.id;
         let arena = self.ensure_arena::<T>();
@@ -293,9 +395,9 @@ impl GcHeap {
         }
     }
 
-    fn alloc_slow<T>(&mut self, value: T) -> GcRoot<T>
+    fn alloc_slow<T>(&mut self, value: T) -> Root<T>
     where
-        T: Any,
+        T: Trace,
     {
         self.gc();
         let heap_id = self.id;
@@ -305,25 +407,69 @@ impl GcHeap {
 
     pub fn get<T>(&self, gc: Gc<T>) -> &T
     where
-        T: Any,
+        T: Trace,
     {
         assert_eq!(self.id, gc.heap_id);
         let arena = self.arena::<T>().unwrap();
-        let index = usize::try_from(gc.index).unwrap();
-        &arena.elements[index]
+        arena.elements.get(gc.index)
     }
 
     pub fn get_mut<T>(&mut self, gc: Gc<T>) -> &mut T
     where
-        T: Any,
+        T: Trace,
     {
         assert_eq!(self.id, gc.heap_id);
         let arena = self.arena_mut::<T>().unwrap();
-        let index = usize::try_from(gc.index).unwrap();
-        &mut arena.elements[index]
+        arena.elements.get_mut(gc.index)
     }
 
     pub fn gc(&mut self) {
-        todo!()
+        let collector = self.collector.as_mut().unwrap();
+        debug_assert!(collector.mark_stacks.values().all(|s| s.is_empty()));
+
+        // Reset/pre-allocate the mark bits.
+        for (ty, arena) in &self.arenas {
+            collector
+                .mark_bits
+                .entry(*ty)
+                .or_default()
+                .reset(arena.capacity());
+        }
+
+        // Mark all roots.
+        for arena in self.arenas.values() {
+            arena.trace_roots(collector);
+        }
+
+        // Mark everything transitively reachable from the roots.
+        //
+        // NB: We have a two-level fixed-point loop to avoid checking if every
+        // mark stack is non-empty on every iteration of the hottest, inner-most
+        // loop.
+        while let Some(type_id) = collector.next_non_empty_mark_stack() {
+            while let Some(index) = collector.pop_mark_stack(type_id) {
+                self.arenas
+                    .get_mut(&type_id)
+                    .unwrap()
+                    .trace_one(index, collector);
+            }
+        }
+
+        // Sweep.
+        for (ty, arena) in &mut self.arenas {
+            let mark_bits = &collector.mark_bits[ty];
+            arena.sweep(mark_bits);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn object_safety() {
+        fn _trace(_: &dyn Trace) {}
+        fn _arena_object(_: &dyn ArenaObject) {}
     }
 }
