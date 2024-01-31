@@ -55,6 +55,12 @@ enum Op {
     AllocC { x: Option<usize>, y: Option<usize> },
     AllocD(Vec<usize>),
 
+    GetA(usize),
+    GetB(usize),
+    GetCX(usize),
+    GetCY(usize),
+    GetD(usize, usize),
+
     SetB(usize, Option<usize>),
     SetCX(usize, Option<usize>),
     SetCY(usize, Option<usize>),
@@ -128,6 +134,11 @@ impl<'a> Arbitrary<'a> for Mutator {
 
             if state.a_count > 0 {
                 choices.push(|u, state| {
+                    let op = Op::GetA(u.int_in_range(0..=state.a_count - 1)?);
+                    state.a_count += 1;
+                    Ok(op)
+                });
+                choices.push(|u, state| {
                     let op = Op::UnrootA(u.int_in_range(0..=state.a_count - 1)?);
                     state.a_count -= 1;
                     Ok(op)
@@ -135,6 +146,11 @@ impl<'a> Arbitrary<'a> for Mutator {
             }
 
             if state.b_count > 0 {
+                choices.push(|u, state| {
+                    let op = Op::GetB(u.int_in_range(0..=state.b_count - 1)?);
+                    state.b_count += 1;
+                    Ok(op)
+                });
                 choices.push(|u, state| {
                     Ok(Op::SetB(
                         u.int_in_range(0..=state.b_count - 1)?,
@@ -153,6 +169,16 @@ impl<'a> Arbitrary<'a> for Mutator {
             }
 
             if state.c_count > 0 {
+                choices.push(|u, state| {
+                    let op = Op::GetCX(u.int_in_range(0..=state.c_count - 1)?);
+                    state.c_count += 1;
+                    Ok(op)
+                });
+                choices.push(|u, state| {
+                    let op = Op::GetCY(u.int_in_range(0..=state.c_count - 1)?);
+                    state.d_count += 1;
+                    Ok(op)
+                });
                 choices.push(|u, state| {
                     Ok(Op::SetCX(
                         u.int_in_range(0..=state.c_count - 1)?,
@@ -181,6 +207,11 @@ impl<'a> Arbitrary<'a> for Mutator {
             }
 
             if state.d_count > 0 {
+                choices.push(|u, state| {
+                    let op = Op::GetD(u.int_in_range(0..=state.d_count - 1)?, u.arbitrary()?);
+                    state.c_count += 1;
+                    Ok(op)
+                });
                 if state.c_count > 0 {
                     choices.push(|u, state| {
                         Ok(Op::SetD(
@@ -229,6 +260,47 @@ impl Mutator {
                 })),
                 Op::AllocD(cs) => {
                     d_roots.push(heap.alloc(D(cs.iter().map(|c| c_roots[*c].unrooted()).collect())))
+                }
+
+                Op::GetA(a) => {
+                    let a = a_roots[*a].clone();
+                    a_roots.push(a);
+                }
+                Op::GetB(b) => {
+                    let b = &b_roots[*b];
+                    let b = match heap[b].0 {
+                        Some(b) => heap.root(b),
+                        None => b.clone(),
+                    };
+                    b_roots.push(b);
+                }
+                Op::GetCX(c) => {
+                    let c = &c_roots[*c];
+                    let x = match heap[c].x {
+                        Some(x) => heap.root(x),
+                        None => c.clone(),
+                    };
+                    c_roots.push(x);
+                }
+                Op::GetCY(c) => {
+                    let c = &c_roots[*c];
+                    let y = match heap[c].y {
+                        Some(y) => heap.root(y),
+                        None => heap.alloc(D(vec![])),
+                    };
+                    d_roots.push(y);
+                }
+                Op::GetD(d, i) => {
+                    let d = &d_roots[*d];
+                    if heap[d].0.len() == 0 {
+                        let c = heap.alloc(C { x: None, y: None });
+                        c_roots.push(c);
+                    } else {
+                        let i = i % heap[d].0.len();
+                        let c = heap[d].0[i];
+                        let c = heap.root(c);
+                        c_roots.push(c);
+                    }
                 }
 
                 Op::SetB(b, c) => {

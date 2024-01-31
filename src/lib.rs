@@ -101,7 +101,14 @@ where
     index: u32,
 }
 
-// TODO: impl clone
+impl<T> Clone for Root<T>
+where
+    T: Trace,
+{
+    fn clone(&self) -> Self {
+        self.roots.insert(self.unrooted())
+    }
+}
 
 impl<T> Drop for Root<T>
 where
@@ -148,7 +155,7 @@ where
     #[inline]
     fn try_alloc(&mut self, heap_id: u32, value: T) -> Result<Root<T>, T> {
         let index = self.elements.try_alloc(value)?;
-        Ok(self.roots.insert(Gc {
+        Ok(self.root(Gc {
             heap_id,
             index,
             _phantom: std::marker::PhantomData,
@@ -161,11 +168,16 @@ where
             self.elements.reserve(additional);
         }
         let index = self.elements.try_alloc(value).ok().unwrap();
-        self.roots.insert(Gc {
+        self.root(Gc {
             heap_id,
             index,
             _phantom: std::marker::PhantomData,
         })
+    }
+
+    #[inline]
+    fn root(&self, gc: Gc<T>) -> Root<T> {
+        self.roots.insert(gc)
     }
 }
 
@@ -332,6 +344,7 @@ where
 }
 
 impl Heap {
+    #[inline]
     pub fn new() -> Self {
         Self {
             id: Self::next_id(),
@@ -340,11 +353,13 @@ impl Heap {
         }
     }
 
+    #[inline]
     fn next_id() -> u32 {
         static ID_COUNTER: atomic::AtomicU32 = atomic::AtomicU32::new(0);
         ID_COUNTER.fetch_add(1, atomic::Ordering::AcqRel)
     }
 
+    #[inline]
     fn arena<T>(&self) -> Option<&Arena<T>>
     where
         T: Trace,
@@ -353,6 +368,7 @@ impl Heap {
         Some(arena.as_any().downcast_ref().unwrap())
     }
 
+    #[inline]
     fn arena_mut<T>(&mut self) -> Option<&mut Arena<T>>
     where
         T: Trace,
@@ -361,6 +377,7 @@ impl Heap {
         Some(arena.as_any_mut().downcast_mut().unwrap())
     }
 
+    #[inline]
     fn ensure_arena<T>(&mut self) -> &mut Arena<T>
     where
         T: Trace,
@@ -373,6 +390,7 @@ impl Heap {
             .unwrap()
     }
 
+    #[inline]
     pub fn alloc<T>(&mut self, value: T) -> Root<T>
     where
         T: Trace,
@@ -385,16 +403,20 @@ impl Heap {
         }
     }
 
+    #[inline(never)]
     fn alloc_slow<T>(&mut self, value: T) -> Root<T>
     where
         T: Trace,
     {
+        // TODO: need to temporarily root `value` across this GC so that its
+        // edges don't get collected.
         self.gc();
         let heap_id = self.id;
         let arena = self.ensure_arena::<T>();
         arena.alloc_slow(heap_id, value)
     }
 
+    #[inline]
     pub fn get<T>(&self, gc: Gc<T>) -> &T
     where
         T: Trace,
@@ -404,6 +426,7 @@ impl Heap {
         arena.elements.get(gc.index)
     }
 
+    #[inline]
     pub fn get_mut<T>(&mut self, gc: Gc<T>) -> &mut T
     where
         T: Trace,
@@ -413,6 +436,17 @@ impl Heap {
         arena.elements.get_mut(gc.index)
     }
 
+    #[inline]
+    pub fn root<T>(&self, gc: Gc<T>) -> Root<T>
+    where
+        T: Trace,
+    {
+        assert_eq!(self.id, gc.heap_id);
+        let arena = self.arena::<T>().unwrap();
+        arena.root(gc)
+    }
+
+    #[inline(never)]
     pub fn gc(&mut self) {
         debug_assert!(self.collector.mark_stacks.values().all(|s| s.is_empty()));
 
