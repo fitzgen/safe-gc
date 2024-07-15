@@ -482,11 +482,27 @@ where
 
     fn sweep(&mut self, mark_bits: &MarkBits) {
         let capacity = self.elements.capacity();
-        let capacity = u32::try_from(capacity).unwrap();
-        for index in 0..capacity {
+        for index in 0..u32::try_from(capacity).unwrap() {
             if !mark_bits.get(index) {
                 self.elements.dealloc(index);
             }
+        }
+
+        // If we are close to running out of capacity, reserve additional
+        // space. This amortizes the cost of collections and avoids the failure
+        // mode where we do a full GC on every object allocation:
+        //
+        // * The arena has zero available capacity.
+        // * The mutator tries to allocate, triggering a GC.
+        // * The GC is able to free up only one (or only a small handfull) of
+        //   slots.
+        // * The mutator's pending allocation fills the newly reclaimed slot.
+        // * Now we are out of capacity again, and the process repeats from the
+        //   top.
+        let len = self.elements.len();
+        let available = capacity - len;
+        if available < capacity / 4 {
+            self.elements.double_capacity();
         }
     }
 }
