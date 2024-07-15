@@ -175,6 +175,22 @@ pub struct Gc<T> {
     _phantom: std::marker::PhantomData<*mut T>,
 }
 
+impl<T> Gc<T> {
+    /// Create a new `Gc<T>` from a raw heap ID and index.
+    pub fn from_raw_parts(heap_id: u32, index: u32) -> Self {
+        Self {
+            heap_id,
+            index,
+            _phantom: std::marker::PhantomData,
+        }
+    }
+
+    /// Get the raw heap ID and index from a `Gc<T>`.
+    pub fn into_raw_parts(self) -> (u32, u32) {
+        (self.heap_id, self.index)
+    }
+}
+
 impl<T> Clone for Gc<T> {
     fn clone(&self) -> Self {
         *self
