@@ -39,11 +39,25 @@ impl<T> FreeList<T> {
 
     pub fn reserve(&mut self, additional: usize) {
         self.entries.reserve(additional);
+
+        // Note that we didn't call `reserve_exact`, so the vector and/or
+        // allocator may have given us a little extra capacity if it was
+        // convenient for them. So make sure to use the actual new capacity,
+        // rather than the requested new capacity.
         while self.entries.len() < self.entries.capacity() {
             let index = u32::try_from(self.entries.len()).unwrap();
             let next_free = std::mem::replace(&mut self.free, Some(index));
             self.entries.push(Entry::Free(next_free));
         }
+    }
+
+    pub fn double_capacity(&mut self) {
+        // Double our capacity to amortize the cost of resizing. But make sure
+        // we add some amount of additional capacity, since doubling zero
+        // capacity isn't useful.
+        const MIN_CAPACITY: usize = 16;
+        let additional = std::cmp::max(self.entries.capacity(), MIN_CAPACITY);
+        self.reserve(additional);
     }
 
     pub fn capacity(&self) -> usize {
@@ -71,11 +85,11 @@ impl<T> FreeList<T> {
 
     pub fn alloc(&mut self, value: T) -> u32 {
         self.try_alloc(value).unwrap_or_else(|value| {
-            self.reserve(1);
-            self.len += 1;
-            let index = self.entries.len();
-            self.entries.push(Entry::Occupied(value));
-            u32::try_from(index).unwrap()
+            // Reserve additional capacity, since we didn't have space for the
+            // allocation.
+            self.double_capacity();
+            // After which the allocation will succeed.
+            self.try_alloc(value).ok().unwrap()
         })
     }
 

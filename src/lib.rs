@@ -426,8 +426,7 @@ where
 
     fn alloc_slow(&mut self, heap_id: u32, value: T) -> Root<T> {
         if self.elements.len() == self.elements.capacity() {
-            let additional = self.elements.len();
-            self.elements.reserve(additional);
+            self.elements.double_capacity();
         }
         let index = self.elements.try_alloc(value).ok().unwrap();
         self.root(Gc {
