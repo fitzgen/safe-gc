@@ -709,6 +709,19 @@ impl Collector {
 /// [`Root<T>`][crate::Root] must maintain its associated entry in the heap's
 /// root set.
 ///
+/// # Finalization and `Drop`
+///
+/// Unlike many GC libraries for Rust, it is perfectly safe and footgun-free to
+/// put `Drop` types in the GC heap, even if they have references to other GC
+/// objects. Finalization of and `Drop` implementations for GC objects is
+/// usually tricky because of the risks of accessing objects that have already
+/// been reclaimed by the collector or accidentally entrenching objects and
+/// making them live again.
+///
+/// The reason this is fine with `safe-gc` is because the `Drop` implementation
+/// doesn't have access to a `Heap`, so it statically *cannot* suffer from those
+/// kinds of bugs.
+///
 /// # Cross-`Heap` GC References
 ///
 /// Typically, GC objects will only reference other GC objects that are within

@@ -32,6 +32,10 @@ Additional features:
   heap. Heaps are *not* constrained to only a single, uniform `T` type of GC
   objects.
 
+* Footgun-free GC object finalization with Rust's regular, old `Drop` trait. No
+  worries about accidentally deref'ing pointers to GC objects the collector has
+  already reclaimed or resurrecting objects it was about to reclaim.
+
 `safe-gc` is not, however, a particularly high-performance garbage collector.
 
 ## Usage
